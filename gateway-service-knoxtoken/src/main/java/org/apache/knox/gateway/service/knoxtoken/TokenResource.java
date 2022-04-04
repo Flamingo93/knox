@@ -19,7 +19,6 @@ package org.apache.knox.gateway.service.knoxtoken;
 
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStoreException;
-import java.security.Principal;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateEncodingException;
 import java.security.cert.X509Certificate;
@@ -29,10 +28,13 @@ import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Enumeration;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
+import java.util.TreeSet;
 import java.util.UUID;
 
 import javax.annotation.PostConstruct;
@@ -45,9 +47,9 @@ import javax.ws.rs.POST;
 import javax.ws.rs.PUT;
 import javax.ws.rs.Path;
 import javax.ws.rs.Produces;
-import javax.ws.rs.QueryParam;
 import javax.ws.rs.core.Context;
 import javax.ws.rs.core.Response;
+import javax.ws.rs.core.UriInfo;
 
 import com.nimbusds.jose.JWSAlgorithm;
 import com.nimbusds.jose.KeyLengthException;
@@ -55,6 +57,9 @@ import com.nimbusds.jose.crypto.MACSigner;
 import com.nimbusds.jose.util.ByteUtils;
 import org.apache.commons.codec.binary.Base64;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.security.authorize.AuthorizationException;
+import org.apache.hadoop.security.authorize.ProxyUsers;
 import org.apache.knox.gateway.config.GatewayConfig;
 import org.apache.knox.gateway.i18n.messages.MessagesFactory;
 import org.apache.knox.gateway.security.SubjectUtils;
@@ -77,6 +82,7 @@ import org.apache.knox.gateway.services.security.token.UnknownTokenException;
 import org.apache.knox.gateway.services.security.token.impl.JWT;
 import org.apache.knox.gateway.services.security.token.impl.JWTToken;
 import org.apache.knox.gateway.services.security.token.impl.TokenMAC;
+import org.apache.knox.gateway.util.AuthFilterUtils;
 import org.apache.knox.gateway.util.JsonUtils;
 import org.apache.knox.gateway.util.Tokens;
 
@@ -117,6 +123,8 @@ public class TokenResource {
   private static final String TSS_MAXIMUM_LIFETIME_TEXT = "maximumLifetimeText";
   private static final String LIFESPAN_INPUT_ENABLED_PARAM = "knox.token.lifespan.input.enabled";
   private static final String LIFESPAN_INPUT_ENABLED_TEXT = "lifespanInputEnabled";
+  static final String KNOX_TOKEN_USER_LIMIT_EXCEEDED_ACTION = "knox.token.user.limit.exceeded.action";
+  private static final String METADATA_QUERY_PARAM_PREFIX = "md_";
   private static final long TOKEN_TTL_DEFAULT = 30000L;
   static final String TOKEN_API_PATH = "knoxtoken/api/v1";
   static final String RESOURCE_PATH = TOKEN_API_PATH + "/token";
@@ -127,6 +135,9 @@ public class TokenResource {
   static final String ENABLE_PATH = "/enable";
   static final String DISABLE_PATH = "/disable";
   private static final String TARGET_ENDPOINT_PULIC_CERT_PEM = "knox.token.target.endpoint.cert.pem";
+  static final String QUERY_PARAMETER_DOAS = "doAs";
+  static final String PROXYUSER_PREFIX = "knox.token.proxyuser";
+
   private static TokenServiceMessages log = MessagesFactory.get(TokenServiceMessages.class);
   private long tokenTTL = TOKEN_TTL_DEFAULT;
   private String tokenType;
@@ -149,6 +160,9 @@ public class TokenResource {
   private Optional<Long> maxTokenLifetime = Optional.empty();
 
   private int tokenLimitPerUser;
+
+  enum UserLimitExceededAction {REMOVE_OLDEST, RETURN_ERROR};
+  private UserLimitExceededAction userLimitExceededAction = UserLimitExceededAction.RETURN_ERROR;
 
   private List<String> allowedRenewers;
 
@@ -246,6 +260,11 @@ public class TokenResource {
       tokenMAC = new TokenMAC(gatewayConfig.getKnoxTokenHashAlgorithm(), aliasService.getPasswordFromAliasForGateway(TokenMAC.KNOX_TOKEN_HASH_KEY_ALIAS_NAME));
 
       tokenLimitPerUser = gatewayConfig.getMaximumNumberOfTokensPerUser();
+      final String userLimitExceededActionParam = context.getInitParameter(KNOX_TOKEN_USER_LIMIT_EXCEEDED_ACTION);
+      if (userLimitExceededActionParam != null) {
+        userLimitExceededAction = UserLimitExceededAction.valueOf(userLimitExceededActionParam);
+        log.generalInfoMessage("Configured Knox Token user limit exceeded action = " + userLimitExceededAction.name());
+      }
 
       String renewIntervalValue = context.getInitParameter(TOKEN_EXP_RENEWAL_INTERVAL);
       if (renewIntervalValue != null && !renewIntervalValue.isEmpty()) {
@@ -276,6 +295,9 @@ public class TokenResource {
       }
     }
     setTokenStateServiceStatusMap();
+
+    final Configuration conf = AuthFilterUtils.getProxyUserConfiguration(context, PROXYUSER_PREFIX);
+    ProxyUsers.refreshSuperUserGroupsConfiguration(conf, PROXYUSER_PREFIX);
   }
 
   private String getTokenTTLAsText() {
@@ -395,11 +417,44 @@ public class TokenResource {
   @GET
   @Path(GET_USER_TOKENS)
   @Produces({APPLICATION_JSON, APPLICATION_XML})
-  public Response getUserTokens(@QueryParam("userName") String userName) {
+  public Response getUserTokens(@Context UriInfo uriInfo) {
     if (tokenStateService == null) {
       return Response.status(Response.Status.SERVICE_UNAVAILABLE).entity("{\n  \"error\": \"Token management is not configured\"\n}\n").build();
     } else {
-      final Collection<KnoxToken> tokens = tokenStateService.getTokens(userName);
+      if (uriInfo == null) {
+        throw new IllegalArgumentException("URI info cannot be NULL.");
+      }
+      final Map<String, String> metadataMap = new HashMap<>();
+      uriInfo.getQueryParameters().entrySet().forEach(entry -> {
+        if (entry.getKey().startsWith(METADATA_QUERY_PARAM_PREFIX)) {
+          String metadataName = entry.getKey().substring(METADATA_QUERY_PARAM_PREFIX.length());
+          metadataMap.put(metadataName, entry.getValue().get(0));
+        }
+      });
+
+      final String userName = uriInfo.getQueryParameters().getFirst("userName");
+      final String createdBy = uriInfo.getQueryParameters().getFirst("createdBy");
+      final Collection<KnoxToken> userTokens = createdBy == null ? tokenStateService.getTokens(userName) : tokenStateService.getDoAsTokens(createdBy);
+      final Collection<KnoxToken> tokens = new TreeSet<>();
+      if (metadataMap.isEmpty()) {
+        tokens.addAll(userTokens);
+      } else {
+        userTokens.forEach(knoxToken -> {
+          for (Map.Entry<String, String> entry : metadataMap.entrySet()) {
+            if (StringUtils.isBlank(entry.getValue()) || "*".equals(entry.getValue())) {
+              // we should only filter tokens by metadata name
+              if (knoxToken.hasMetadata(entry.getKey())) {
+                tokens.add(knoxToken);
+              }
+            } else {
+              // metadata value should also match
+              if (entry.getValue().equals(knoxToken.getMetadataValue(entry.getKey()))) {
+                tokens.add(knoxToken);
+              }
+            }
+          }
+        });
+      }
       return Response.status(Response.Status.OK).entity(JsonUtils.renderAsJsonString(Collections.singletonMap("tokens", tokens))).build();
     }
   }
@@ -627,7 +682,24 @@ public class TokenResource {
         .getAttribute(GatewayServices.GATEWAY_SERVICES_ATTRIBUTE);
 
     JWTokenAuthority ts = services.getService(ServiceType.TOKEN_SERVICE);
-    Principal p = request.getUserPrincipal();
+
+    String userName = request.getUserPrincipal().getName();
+    String createdBy = null;
+    // checking the doAs user only makes sense if tokens are managed (this is where we store the userName information)
+    if (tokenStateService != null) {
+      final String doAsUser = request.getParameter(QUERY_PARAMETER_DOAS);
+      if (doAsUser != null && !doAsUser.equals(userName)) {
+        try {
+          //this call will authorize the doAs request
+          AuthFilterUtils.authorizeImpersonationRequest(request, doAsUser);
+          createdBy = userName;
+          userName = doAsUser;
+        } catch (AuthorizationException e) {
+          return Response.status(Response.Status.FORBIDDEN).entity("{ \"" + e.getMessage() + "\" }").build();
+        }
+      }
+    }
+
     long expires = getExpiry();
 
     if (endpointPublicCert == null) {
@@ -654,9 +726,17 @@ public class TokenResource {
 
     if (tokenStateService != null) {
       if (tokenLimitPerUser != -1) { // if -1 => unlimited tokens for all users
-        if (tokenStateService.getTokens(p.getName()).size() >= tokenLimitPerUser) {
-          log.tokenLimitExceeded(p.getName());
-          return Response.status(Response.Status.FORBIDDEN).entity("{ \"Unable to get token - token limit exceeded.\" }").build();
+        final Collection<KnoxToken> userTokens = tokenStateService.getTokens(userName);
+        if (userTokens.size() >= tokenLimitPerUser) {
+          log.tokenLimitExceeded(userName);
+          if (UserLimitExceededAction.RETURN_ERROR == userLimitExceededAction) {
+            return Response.status(Response.Status.FORBIDDEN).entity("{ \"Unable to get token - token limit exceeded.\" }").build();
+          } else {
+            // userTokens is an ordered collection (by issue time) -> the first element is the oldest one
+            final String oldestTokenId = userTokens.iterator().next().getTokenId();
+            log.generalInfoMessage(String.format(Locale.getDefault(), "Revoking %s's oldest token %s ...", userName, Tokens.getTokenIDDisplayText(oldestTokenId)));
+            revoke(oldestTokenId);
+           }
         }
       }
     }
@@ -667,7 +747,7 @@ public class TokenResource {
       JWTokenAttributes jwtAttributes;
       final JWTokenAttributesBuilder jwtAttributesBuilder = new JWTokenAttributesBuilder();
       jwtAttributesBuilder
-          .setPrincipal(p)
+          .setUserName(userName)
           .setAlgorithm(signatureAlgorithm)
           .setExpires(expires)
           .setManaged(managedToken)
@@ -713,8 +793,12 @@ public class TokenResource {
                                      expires,
                                      maxTokenLifetime.orElse(tokenStateService.getDefaultMaxLifetimeDuration()));
           final String comment = request.getParameter(COMMENT);
-          final TokenMetadata tokenMetadata = new TokenMetadata(p.getName(), StringUtils.isBlank(comment) ? null : comment);
-          tokenMetadata.setPasscode(tokenMAC.hash(tokenId, issueTime, p.getName(), passcode));
+          final TokenMetadata tokenMetadata = new TokenMetadata(userName, StringUtils.isBlank(comment) ? null : comment);
+          tokenMetadata.setPasscode(tokenMAC.hash(tokenId, issueTime, userName, passcode));
+          addArbitraryTokenMetadata(tokenMetadata);
+          if (createdBy != null) {
+            tokenMetadata.setCreatedBy(createdBy);
+          }
           tokenStateService.addMetadata(tokenId, tokenMetadata);
           log.storedToken(getTopologyName(), Tokens.getTokenDisplayText(accessToken), Tokens.getTokenIDDisplayText(tokenId));
         }
@@ -727,6 +811,18 @@ public class TokenResource {
       log.unableToIssueToken(e);
     }
     return Response.ok().entity("{ \"Unable to acquire token.\" }").build();
+  }
+
+  private void addArbitraryTokenMetadata(TokenMetadata tokenMetadata) {
+    final Enumeration<String> paramNames = request.getParameterNames();
+    while (paramNames.hasMoreElements()) {
+      final String paramName = paramNames.nextElement();
+      if (paramName.startsWith(METADATA_QUERY_PARAM_PREFIX)) {
+        final String metadataName = paramName.substring(METADATA_QUERY_PARAM_PREFIX.length());
+        final String metadataValue = request.getParameter(paramName);
+        tokenMetadata.add(metadataName, metadataValue);
+      }
+    }
   }
 
   private String generatePasscodeField(String tokenId, String passcode) {

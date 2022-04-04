@@ -19,6 +19,7 @@ package org.apache.knox.gateway.service.knoxtoken;
 
 import static org.apache.knox.gateway.config.impl.GatewayConfigImpl.KNOX_TOKEN_USER_LIMIT;
 import static org.apache.knox.gateway.config.impl.GatewayConfigImpl.KNOX_TOKEN_USER_LIMIT_DEFAULT;
+import static org.apache.knox.gateway.service.knoxtoken.TokenResource.KNOX_TOKEN_USER_LIMIT_EXCEEDED_ACTION;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
@@ -64,7 +65,10 @@ import org.junit.Test;
 import javax.security.auth.Subject;
 import javax.servlet.ServletContext;
 import javax.servlet.http.HttpServletRequest;
+import javax.ws.rs.core.MultivaluedHashMap;
+import javax.ws.rs.core.MultivaluedMap;
 import javax.ws.rs.core.Response;
+import javax.ws.rs.core.UriInfo;
 
 import java.io.IOException;
 import java.security.KeyPair;
@@ -82,6 +86,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -93,6 +98,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.function.Predicate;
 
 /**
  * Some tests for the token service
@@ -143,6 +149,7 @@ public class TokenServiceResourceTest {
   private void configureCommonExpectations(Map<String, String> contextExpectations, String expectedSubjectDN, Boolean serverManagedTssEnabled) throws Exception {
     context = EasyMock.createNiceMock(ServletContext.class);
     contextExpectations.forEach((key, value) -> EasyMock.expect(context.getInitParameter(key)).andReturn(value).anyTimes());
+    EasyMock.expect(context.getInitParameterNames()).andReturn(Collections.enumeration(contextExpectations.keySet())).anyTimes();
     request = EasyMock.createNiceMock(HttpServletRequest.class);
     EasyMock.expect(request.getServletContext()).andReturn(context).anyTimes();
     Principal principal = EasyMock.createNiceMock(Principal.class);
@@ -152,6 +159,10 @@ public class TokenServiceResourceTest {
     if (contextExpectations.containsKey(TokenResource.LIFESPAN)) {
       EasyMock.expect(request.getParameter(TokenResource.LIFESPAN)).andReturn(contextExpectations.get(TokenResource.LIFESPAN)).anyTimes();
     }
+    if (contextExpectations.containsKey(TokenResource.QUERY_PARAMETER_DOAS)) {
+      EasyMock.expect(request.getParameter(TokenResource.QUERY_PARAMETER_DOAS)).andReturn(contextExpectations.get(TokenResource.QUERY_PARAMETER_DOAS)).anyTimes();
+    }
+    EasyMock.expect(request.getParameterNames()).andReturn(Collections.emptyEnumeration()).anyTimes();
 
     GatewayServices services = EasyMock.createNiceMock(GatewayServices.class);
     EasyMock.expect(context.getAttribute(GatewayServices.GATEWAY_SERVICES_ATTRIBUTE)).andReturn(services).anyTimes();
@@ -984,12 +995,12 @@ public class TokenServiceResourceTest {
 
   @Test
   public void testConfiguredTokenLimitPerUser() throws Exception {
-    testLimitingTokensPerUser(String.valueOf(KNOX_TOKEN_USER_LIMIT_DEFAULT), KNOX_TOKEN_USER_LIMIT_DEFAULT);
+    testLimitingTokensPerUser(KNOX_TOKEN_USER_LIMIT_DEFAULT, KNOX_TOKEN_USER_LIMIT_DEFAULT);
   }
 
   @Test
   public void testUnlimitedTokensPerUser() throws Exception {
-    testLimitingTokensPerUser(String.valueOf("-1"), 100);
+    testLimitingTokensPerUser(-1, 100);
   }
 
   @Test
@@ -1006,7 +1017,7 @@ public class TokenServiceResourceTest {
     for (int i = 0; i < numberOfPreExistingTokens; i++) {
       tr.doGet();
     }
-    Response getKnoxTokensResponse = tr.getUserTokens(USER_NAME);
+    Response getKnoxTokensResponse = getUserTokensResponse(tr);
     Collection<String> tokens = ((Map<String, Collection<String>>) JsonUtils.getObjectFromJsonString(getKnoxTokensResponse.getEntity().toString()))
             .get("tokens");
     assertEquals(tokens.size(), numberOfPreExistingTokens);
@@ -1020,19 +1031,48 @@ public class TokenServiceResourceTest {
     assertTrue(response.getEntity().toString().contains("Unable to get token - token limit exceeded."));
   }
 
+  private Response getUserTokensResponse(TokenResource tokenResource) {
+    return getUserTokensResponse(tokenResource, false);
+  }
+
+  private Response getUserTokensResponse(TokenResource tokenResource, boolean createdBy) {
+    final MultivaluedMap<String, String> queryParameters = new MultivaluedHashMap<>();
+    queryParameters.put(createdBy ? "createdBy" : "userName", Arrays.asList(USER_NAME));
+    final UriInfo uriInfo = EasyMock.createNiceMock(UriInfo.class);
+    EasyMock.expect(uriInfo.getQueryParameters()).andReturn(queryParameters).anyTimes();
+    EasyMock.replay(uriInfo);
+    return tokenResource.getUserTokens(uriInfo);
+  }
+
   @Test
   public void testTokenLimitPerUserExceeded() throws Exception {
     try {
-      testLimitingTokensPerUser(String.valueOf("10"), 11);
+      testLimitingTokensPerUser(10, 11);
       fail("Exception should have been thrown");
     } catch (Exception e) {
       assertTrue(e.getMessage().contains("Unable to get token - token limit exceeded."));
     }
   }
 
-  private void testLimitingTokensPerUser(String configuredLimit, int numberOfTokens) throws Exception {
+  @Test
+  public void testTokenLimitPerUserExceededShouldRevokeOldestToken() throws Exception {
+    try {
+      testLimitingTokensPerUser(10, 11, true);
+    } catch (Exception e) {
+      fail("Exception should NOT have been thrown");
+    }
+  }
+
+  private void testLimitingTokensPerUser(int configuredLimit, int numberOfTokens) throws Exception {
+    testLimitingTokensPerUser(configuredLimit, numberOfTokens, false);
+  }
+
+  private void testLimitingTokensPerUser(int configuredLimit, int numberOfTokens, boolean revokeOldestToken) throws Exception {
     final Map<String, String> contextExpectations = new HashMap<>();
-    contextExpectations.put(KNOX_TOKEN_USER_LIMIT, configuredLimit);
+    contextExpectations.put(KNOX_TOKEN_USER_LIMIT, String.valueOf(configuredLimit));
+    if (revokeOldestToken) {
+      contextExpectations.put(KNOX_TOKEN_USER_LIMIT_EXCEEDED_ACTION, TokenResource.UserLimitExceededAction.REMOVE_OLDEST.name());
+    }
     configureCommonExpectations(contextExpectations, Boolean.TRUE);
 
     final TokenResource tr = new TokenResource();
@@ -1041,15 +1081,40 @@ public class TokenServiceResourceTest {
     tr.init();
 
     for (int i = 0; i < numberOfTokens; i++) {
-      final Response getTokenResponse = tr.doGet();
+      final Response getTokenResponse = Subject.doAs(createTestSubject(USER_NAME), (PrivilegedAction<Response>) () -> tr.doGet());
       if (getTokenResponse.getStatus() != Response.Status.OK.getStatusCode()) {
         throw new Exception(getTokenResponse.getEntity().toString());
       }
     }
-    final Response getKnoxTokensResponse = tr.getUserTokens(USER_NAME);
+    final Response getKnoxTokensResponse = getUserTokensResponse(tr);
     final Collection<String> tokens = ((Map<String, Collection<String>>) JsonUtils.getObjectFromJsonString(getKnoxTokensResponse.getEntity().toString()))
         .get("tokens");
-    assertEquals(tokens.size(), numberOfTokens);
+    assertEquals(tokens.size(), revokeOldestToken ? configuredLimit : numberOfTokens);
+  }
+
+  @Test
+  public void testCreateImpersonatedToken() throws Exception {
+    final String impersonatedUser = "testUser";
+    final Map<String, String> contextExpectations = new HashMap<>();
+    contextExpectations.put(TokenResource.QUERY_PARAMETER_DOAS, impersonatedUser);
+    contextExpectations.put(TokenResource.PROXYUSER_PREFIX + "." + USER_NAME + ".users", impersonatedUser);
+    contextExpectations.put(TokenResource.PROXYUSER_PREFIX + "." + USER_NAME + ".hosts", "*");
+    configureCommonExpectations(contextExpectations, Boolean.TRUE);
+
+    final TokenResource tr = new TokenResource();
+    tr.request = request;
+    tr.context = context;
+    tr.init();
+
+    tr.doGet();
+
+    final Response getKnoxTokensResponse = getUserTokensResponse(tr, true);
+    final Collection<LinkedHashMap<String, Object>> tokens = ((Map<String, Collection<LinkedHashMap<String, Object>>>) JsonUtils
+        .getObjectFromJsonString(getKnoxTokensResponse.getEntity().toString())).get("tokens");
+    final LinkedHashMap<String, Object> knoxToken = tokens.iterator().next();
+    final Map<String, String> metadata = (Map<String, String>) knoxToken.get("metadata");
+    assertEquals(metadata.get("createdBy"), USER_NAME);
+    assertEquals(metadata.get("userName"), impersonatedUser);
   }
 
   /**
@@ -1395,6 +1460,10 @@ public class TokenServiceResourceTest {
 
     @Override
     public void revokeToken(String tokenId) {
+      issueTimes.remove(tokenId);
+      expirationData.remove(tokenId);
+      maxLifetimes.remove(tokenId);
+      tokenMetadata.remove(tokenId);
     }
 
     @Override
@@ -1444,11 +1513,26 @@ public class TokenServiceResourceTest {
 
     @Override
     public Collection<KnoxToken> getTokens(String userName) {
+      return fetchTokens(userName, false);
+    }
+
+    @Override
+    public Collection<KnoxToken> getDoAsTokens(String createdBy) {
+      return fetchTokens(createdBy, true);
+    }
+
+    private Collection<KnoxToken> fetchTokens(String userName, boolean createdBy) {
       final Collection<KnoxToken> tokens = new TreeSet<>();
-      tokenMetadata.entrySet().stream().filter(entry -> entry.getValue().getUserName().equals(userName)).forEach(metadata -> {
+      final Predicate<Map.Entry<String, TokenMetadata>> filterPredicate;
+      if (createdBy) {
+        filterPredicate = entry -> userName.equals(entry.getValue().getCreatedBy());
+      } else {
+        filterPredicate = entry -> userName.equals(entry.getValue().getUserName());
+      }
+      tokenMetadata.entrySet().stream().filter(filterPredicate).forEach(metadata -> {
         String tokenId = metadata.getKey();
         try {
-          tokens.add(new KnoxToken(tokenId, getTokenIssueTime(tokenId), getTokenExpiration(tokenId), 0L, metadata.getValue()));
+          tokens.add(new KnoxToken(tokenId, getTokenIssueTime(tokenId), getTokenExpiration(tokenId), getMaxLifetime(tokenId), metadata.getValue()));
         } catch (UnknownTokenException e) {
           // NOP
         }
@@ -1489,7 +1573,7 @@ public class TokenServiceResourceTest {
     public JWT issueToken(JWTokenAttributes jwtAttributes) {
       String[] claimArray = new String[6];
       claimArray[0] = "KNOXSSO";
-      claimArray[1] = jwtAttributes.getPrincipal().getName();
+      claimArray[1] = jwtAttributes.getUserName();
       claimArray[2] = null;
       if (jwtAttributes.getExpires() == -1) {
         claimArray[3] = null;
